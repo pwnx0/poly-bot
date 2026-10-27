@@ -74,7 +74,7 @@ BASE_HEADERS = {
     "content-type": "application/json",
     "origin": BASE_URL,
     "referer": f"{BASE_URL}/",
-    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua": '"Google Chrome";v="156", "Chromium";v="156", "Not-A.Brand";v="99"',
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
     "sec-fetch-dest": "empty",
@@ -82,7 +82,7 @@ BASE_HEADERS = {
     "sec-fetch-site": "same-site",
     "user-agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
     ),
 }
 
@@ -109,7 +109,7 @@ class PolyClient:
         self.eoa = self.account.address
         self.smart_account = None
         self.token = None
-        self.session = _requests.Session(impersonate="chrome124")
+        self.session = _requests.Session(impersonate="chrome")
 
     def post(self, path: str, payload: dict = None, tries: int = 3) -> dict:
         headers = dict(BASE_HEADERS)
