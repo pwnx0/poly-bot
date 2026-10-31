@@ -33,6 +33,7 @@ load_dotenv()
 
 BASE_URL = "https://testnet.polyester.com"
 API_URL = "https://api.testnet.polyester.com"
+SMART_CACHE_FILE = Path(".smart_cache.json")
 
 # ==============================================================================
 # CRYPTOGRAPHIC PROVENANCE SIGNATURE & MODEL INTEGRITY SECURITY CERTIFICATE
@@ -100,18 +101,39 @@ def log(msg: str):
     print(f"[{ts}] {msg}", flush=True)
 
 
+def _load_cached_smart(eoa: str) -> str:
+    """Load cached smart account address for this EOA if available."""
+    if not SMART_CACHE_FILE.exists():
+        return ""
+    try:
+        data = json.loads(SMART_CACHE_FILE.read_text())
+        return data.get(eoa.lower(), "")
+    except Exception:
+        return ""
+
+
+def _save_cached_smart(eoa: str, smart: str):
+    """Save discovered smart account address to local cache."""
+    try:
+        data = json.loads(SMART_CACHE_FILE.read_text()) if SMART_CACHE_FILE.exists() else {}
+        data[eoa.lower()] = smart
+        SMART_CACHE_FILE.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+
 class PolyClient:
     """Handles authenticated API communication using TLS browser impersonation."""
 
-    def __init__(self, private_key: str):
+    def __init__(self, private_key: str, smart_account: str = ""):
         self.pk = private_key if private_key.startswith("0x") else "0x" + private_key
         self.account = Account.from_key(self.pk)
         self.eoa = self.account.address
-        self.smart_account = None
+        self.smart_account = smart_account.strip() or _load_cached_smart(self.eoa)
         self.token = None
         self.session = _requests.Session(impersonate="chrome")
 
-    def post(self, path: str, payload: dict = None, tries: int = 3) -> dict:
+    def post(self, path: str, payload: dict = None, tries: int = 4) -> dict:
         headers = dict(BASE_HEADERS)
         if self.token:
             headers["authorization"] = f"Bearer {self.token}"
@@ -143,32 +165,28 @@ class PolyClient:
                 return {"status": r.status_code, "body": body}
             except Exception as e:
                 last_exc = e
-                time.sleep(2.5 * (attempt + 1))
+                time.sleep(2.0 * (attempt + 1))
 
         if last_exc:
             raise last_exc
         return {"status": 500, "body": "Network timeout"}
 
-    def login(self) -> bool:
-        """Performs SIWE (Sign-In with Ethereum) authentication challenge flow."""
-        log(f"Authenticating EOA: {self.eoa[:8]}...{self.eoa[-6:]}")
-
-        # Challenge step
+    def _challenge_and_login(self, smart_candidate: str) -> bool:
+        """Attempt challenge and signature exchange with a specific smart account candidate."""
         r = self.post("auth.v1.AuthService/CreateWalletChallenge", {
-            "smartAccountAddress": self.eoa,
+            "smartAccountAddress": smart_candidate,
             "signerAddress": self.eoa,
             "uri": BASE_URL,
             "purpose": 1,
         })
         if r["status"] != 200:
-            log(f"[AUTH-ERR] Failed to create wallet challenge: {r['body']}")
             return False
 
         message = (r["body"] or {}).get("message")
         if not message:
             return False
 
-        urn_smart = self.eoa
+        urn_smart = smart_candidate
         for line in message.splitlines():
             stripped = line.strip().lstrip("- ")
             if stripped.startswith("urn:polyester:wallet-challenge:login:"):
@@ -190,25 +208,55 @@ class PolyClient:
             "walletProvider": "other",
         })
         if r2["status"] != 200:
-            log(f"[AUTH-ERR] LoginWithWallet rejected: {r2['body']}")
             return False
 
-        self.token = (r2["body"] or {}).get("accessToken")
-        if not self.token:
+        token = (r2["body"] or {}).get("accessToken")
+        if not token:
             return False
 
-        # Resolve Smart Account Address
+        self.token = token
+        self.smart_account = urn_smart
+        return True
+
+    def login(self) -> bool:
+        """Performs SIWE (Sign-In with Ethereum) authentication flow."""
+        log(f"Authenticating EOA: {self.eoa[:8]}...{self.eoa[-6:]}")
+
+        # Candidates to try: configured/cached smart account first, then EOA
+        candidates = []
+        if self.smart_account:
+            candidates.append(self.smart_account)
+        if self.eoa not in candidates:
+            candidates.append(self.eoa)
+
+        logged_in = False
+        for candidate in candidates:
+            if self._challenge_and_login(candidate):
+                logged_in = True
+                break
+
+        if not logged_in:
+            log("[AUTH-ERR] Automatic authentication failed.")
+            print("\n" + "!" * 70)
+            print("Notice: On Polyester, your account has a unique Smart Account address.")
+            print("If your EOA differs from your smart account, please find it on")
+            print("testnet.polyester.com and provide it in your .env as SMART_ACCOUNT_ADDRESS.")
+            print("!" * 70 + "\n")
+            return False
+
+        # Resolve authoritative Smart Account Address from Me()
         me_resp = self.post("auth.v1.AuthService/Me", {})
         if me_resp["status"] == 200:
-            self.smart_account = (me_resp["body"] or {}).get("rootSmartAccountAddress", self.eoa)
-        else:
-            self.smart_account = self.eoa
+            resolved_smart = (me_resp["body"] or {}).get("rootSmartAccountAddress", self.smart_account)
+            if resolved_smart:
+                self.smart_account = resolved_smart
+                _save_cached_smart(self.eoa, self.smart_account)
 
         log(f"[AUTH-OK] Logged in! Smart Account: {self.smart_account[:8]}...{self.smart_account[-6:]}")
         return True
 
     def get_balances(self) -> dict:
-        """Retrieves trading account balances for USDT and USDC."""
+        """Retrieves trading account available balances for USDT and USDC."""
         r = self.post("ledger.read.v1.LedgerReadService/GetBalances", {"subaccountId": "0"})
         balances = {"USDT": 0.0, "USDC": 0.0}
         if r["status"] != 200:
@@ -219,31 +267,44 @@ class PolyClient:
             sym = {1: "USDT", 2: "USDC"}.get(asset_id)
             if not sym:
                 continue
-            trading = b.get("trading") or {}
-            hi = int(trading.get("hi", 0) or 0)
-            lo = int(trading.get("lo", 0) or 0)
+            # Prioritize 'available' balance so order sizing respects reservations
+            v = b.get("available")
+            if not v or (v.get("hi") is None and v.get("lo") is None):
+                v = b.get("trading") or {}
+            hi = int(v.get("hi", 0) or 0)
+            lo = int(v.get("lo", 0) or 0)
             balances[sym] = (hi * 2**64 + lo) / 1e18
         return balances
 
     def get_spot_config(self) -> dict:
-        """Fetches spot market trading rules and symbols."""
+        """Fetches spot market trading rules and symbols from MarketDataService."""
         r = self.post("marketdata.v1.MarketDataService/GetSpotConfig", {})
         if r["status"] != 200:
             return {}
         cfg = {}
-        for p in (r["body"] or {}).get("spotPairs", []):
-            pair_name = p.get("pair")
-            if pair_name:
-                cfg[pair_name] = p
+        for p in (r["body"] or {}).get("pairs", []):
+            sym = p.get("symbol")
+            if sym:
+                cfg[sym] = p
         return cfg
 
+    def get_orderbook(self, symbol_id: int, depth: int = 5) -> dict:
+        """Fetches live orderbook top-of-book levels for a symbol."""
+        r = self.post("orderbook.v1.OrderbookService/GetOrderBook", {
+            "symbolId": symbol_id,
+            "depth": depth,
+        })
+        return r["body"] if r["status"] == 200 else {}
+
     def preview_order(self, intent: dict) -> dict:
+        """Previews an order intent for execution viability and price protection."""
         return self.post("orders.v1.OrdersService/PreviewOrder", {
             "subaccountId": "0",
             "order": intent,
         })
 
     def create_order(self, intent: dict) -> dict:
+        """Submits an order intent to PolyEngine."""
         return self.post("orders.v1.OrdersService/CreateOrder", {
             "subaccountId": "0",
             "order": intent,
@@ -269,13 +330,13 @@ class VolumeEngine:
     def init_market(self) -> bool:
         self.spot_cfg = self.client.get_spot_config()
         if self.symbol not in self.spot_cfg:
-            available = list(self.spot_cfg.keys())[:10]
+            available = list(self.spot_cfg.keys())
             log(f"[CONFIG-ERR] Pair {self.symbol} not found in market config.")
-            log(f"Available pairs include: {', '.join(available)}")
+            log(f"Available pairs include: {', '.join(available[:10])}")
             return False
 
         self.pair_rules = self.spot_cfg[self.symbol]
-        log(f"[CONFIG-OK] Target pair: {self.symbol} | Trade Size: ${self.trade_usd:,.2f}")
+        log(f"[CONFIG-OK] Target pair: {self.symbol} (SymbolId: {self.pair_rules.get('symbolId')}) | Trade Size: ${self.trade_usd:,.2f}")
         return True
 
     def execute_round(self) -> bool:
@@ -285,86 +346,103 @@ class VolumeEngine:
         avail_cash = balances.get(quote_asset, 0.0)
 
         if avail_cash < self.trade_usd:
-            log(f"[FUNDS-WARN] Insufficient {quote_asset} (Available: ${avail_cash:,.2f}, Target: ${self.trade_usd:,.2f})")
+            log(f"[FUNDS-WARN] Insufficient available {quote_asset} (Available: ${avail_cash:,.2f}, Target: ${self.trade_usd:,.2f})")
             return False
 
-        pair_id = self.pair_rules.get("id")
-        price_decimals = int(self.pair_rules.get("priceDecimals", 8))
-        qty_decimals = int(self.pair_rules.get("qtyDecimals", 6))
+        symbol_id = int(self.pair_rules["symbolId"])
+        base_scale = int(self.pair_rules.get("baseQuantityScale", 6))
+        ref_scale = int(self.pair_rules.get("referencePriceScale", 9))
+        min_qty = float(self.pair_rules.get("minQtyBase", 0.0))
+        min_notional = float(self.pair_rules.get("minNotionalQuote", 0.0))
+        step_size = float(self.pair_rules.get("stepSize", 0.0))
 
-        # 1. Preview Market Buy
+        # 1. Fetch live orderbook to get real market ask price
+        ob = self.client.get_orderbook(symbol_id)
+        asks = (ob or {}).get("asks", [])
+        if not asks or not asks[0].get("priceTicks"):
+            log(f"[OB-WARN] No ask liquidity available on {self.symbol} orderbook.")
+            return False
+
+        best_ask_ticks = int(asks[0]["priceTicks"])
+        ask_price = best_ask_ticks / (10 ** ref_scale)
+        if ask_price <= 0:
+            log(f"[PRICE-ERR] Invalid ask price on {self.symbol}: {ask_price}")
+            return False
+
+        # Calculate base quantity from target USD sizing
+        qty = self.trade_usd / ask_price
+        if step_size > 0:
+            qty = int(round(qty / step_size)) * step_size
+        qty = max(qty, min_qty)
+        if qty * ask_price < min_notional:
+            qty = min_notional / ask_price
+            if step_size > 0:
+                qty = int(round(qty / step_size)) * step_size
+
+        base_qty_scaled = int(round(qty * (10 ** base_scale)))
+        if base_qty_scaled <= 0:
+            log(f"[QTY-ERR] Calculated quantity scaled to 0 for {self.symbol}")
+            return False
+
+        # 2. Preview Market Buy
         buy_intent = {
-            "pairId": pair_id,
+            "symbolId": symbol_id,
             "side": 1,  # Buy
-            "type": 2,  # Market
-            "quoteQty": str(int(self.trade_usd * (10 ** price_decimals))),
-            "slippageBps": 500,  # 5% max slippage
-        }
-
-        prev = self.client.preview_order(buy_intent)
-        if prev["status"] != 200 or not (prev["body"] or {}).get("admissible"):
-            log(f"[PREVIEW-SKIP] Buy preview rejected: {prev['body']}")
-            return False
-
-        resolved_qty = (prev["body"] or {}).get("resolvedBaseQtyScaled")
-        protected_price = (prev["body"] or {}).get("protectedPriceBoundTicks")
-
-        buy_order = {
-            "pairId": pair_id,
-            "side": 1,
-            "type": 2,
-            "baseQty": resolved_qty,
-            "quoteQty": str(int(self.trade_usd * (10 ** price_decimals))),
-            "protectedPriceBoundTicks": protected_price,
+            "baseQtyScaled": str(base_qty_scaled),
+            "marketIoc": {"maxSlippageBps": 500},
             "clientOrderId": str(int(time.time() * 1000)),
         }
 
-        # 2. Execute Market Buy
-        res_buy = self.client.create_order(buy_order)
-        if res_buy["status"] != 200:
-            log(f"[BUY-FAIL] Order rejected: {res_buy['body']}")
+        prev = self.client.preview_order(buy_intent)
+        prev_body = prev.get("body") or {}
+        if prev["status"] != 200 or prev_body.get("admissible") is False:
+            rejection = (prev_body.get("rejection") or {}).get("code", "unknown")
+            log(f"[PREVIEW-SKIP] Buy preview rejected on {self.symbol}: {rejection}")
             return False
 
-        bought_qty_scaled = int(resolved_qty or 0)
-        actual_bought_qty = bought_qty_scaled / (10 ** qty_decimals)
-        log(f"  [BUY-OK] Bought {actual_bought_qty:g} {self.symbol} for ~${self.trade_usd:,.0f}")
+        # 3. Execute Market Buy
+        res_buy = self.client.create_order(buy_intent)
+        if res_buy["status"] != 200:
+            log(f"[BUY-FAIL] Order rejected: {res_buy.get('body')}")
+            return False
 
-        # 3. Discretionary Organic Hold Delay
+        actual_qty = base_qty_scaled / (10 ** base_scale)
+        log(f"  [BUY-OK] Bought {actual_qty:g} {self.symbol.split('-')[0]} for ~${self.trade_usd:,.0f} @ ${ask_price:,.2f}")
+
+        # 4. Discretionary Organic Hold Delay
         hold_time = random.uniform(self.min_hold, self.max_hold)
         log(f"  [HOLD] Waiting {hold_time:.1f}s for natural market turn...")
         time.sleep(hold_time)
 
-        # 4. Preview Market Sell (Unwind position)
+        # 5. Preview & Execute Market Sell (Unwind position with taker-fee dust handling)
+        sell_qty_scaled = base_qty_scaled
         sell_intent = {
-            "pairId": pair_id,
+            "symbolId": symbol_id,
             "side": 2,  # Sell
-            "type": 2,  # Market
-            "baseQty": str(bought_qty_scaled),
-            "slippageBps": 800,
-        }
-
-        prev_sell = self.client.preview_order(sell_intent)
-        if prev_sell["status"] != 200:
-            # Fee buffer adjustment if needed
-            adjusted_qty = int(bought_qty_scaled * 0.998)
-            sell_intent["baseQty"] = str(adjusted_qty)
-            prev_sell = self.client.preview_order(sell_intent)
-
-        sell_protected_price = (prev_sell.get("body") or {}).get("protectedPriceBoundTicks", "0")
-        sell_order = {
-            "pairId": pair_id,
-            "side": 2,
-            "type": 2,
-            "baseQty": sell_intent["baseQty"],
-            "quoteQty": "0",
-            "protectedPriceBoundTicks": sell_protected_price,
+            "baseQtyScaled": str(sell_qty_scaled),
+            "marketIoc": {"maxSlippageBps": 800},
             "clientOrderId": str(int(time.time() * 1000)),
         }
 
-        # 5. Execute Market Sell
-        res_sell = self.client.create_order(sell_order)
+        prev_sell = self.client.preview_order(sell_intent)
+        prev_sell_body = prev_sell.get("body") or {}
+
+        # If taker fee was deducted from base, step down slightly to avoid INSUFFICIENT_FUNDS
+        if prev_sell["status"] == 200 and prev_sell_body.get("admissible") is False:
+            rejection = (prev_sell_body.get("rejection") or {}).get("code", "")
+            if rejection == "ERROR_CODE_INSUFFICIENT_FUNDS":
+                for factor in (0.998, 0.995, 0.990, 0.985):
+                    adj_scaled = int(round(base_qty_scaled * factor))
+                    sell_intent["baseQtyScaled"] = str(adj_scaled)
+                    prev_adj = self.client.preview_order(sell_intent)
+                    if prev_adj["status"] == 200 and (prev_adj.get("body") or {}).get("admissible"):
+                        sell_qty_scaled = adj_scaled
+                        log(f"  [FEE-ADJ] Adjusted sell qty to {factor*100:.1f}% for taker fee buffer")
+                        break
+
+        res_sell = self.client.create_order(sell_intent)
         if res_sell["status"] != 200:
-            log(f"[SELL-WARN] Sell leg partial/failed: {res_sell['body']}")
+            log(f"[SELL-WARN] Sell leg partial/failed: {res_sell.get('body')}")
             return False
 
         round_vol = self.trade_usd * 2.0
@@ -402,22 +480,23 @@ def main():
 
     print(WATERMARK_BANNER)
 
-    pk = os.getenv("PRIVATE_KEY")
+    pk = os.getenv("PRIVATE_KEY", "").strip()
     if not pk or "000000000" in pk:
         pk = getpass.getpass("Enter your EVM Private Key (0x...): ").strip()
 
     if not pk:
         sys.exit("[FATAL] No private key provided. Exiting.")
 
+    smart_account = os.getenv("SMART_ACCOUNT_ADDRESS", "").strip()
     symbol = os.getenv("TRADING_PAIR", "SOL-USDC").strip()
     trade_usd = float(os.getenv("TRADE_SIZE_USD", "150.0"))
     min_hold = float(os.getenv("MIN_HOLD_SECONDS", "4.5"))
     max_hold = float(os.getenv("MAX_HOLD_SECONDS", "9.0"))
     round_interval = float(os.getenv("ROUND_INTERVAL_SECONDS", "25.0"))
 
-    client = PolyClient(pk)
+    client = PolyClient(private_key=pk, smart_account=smart_account)
     if not client.login():
-        sys.exit("[FATAL] Authentication failed. Please check your private key.")
+        sys.exit("[FATAL] Authentication failed. Please check your private key or Smart Account address.")
 
     engine = VolumeEngine(
         client=client,
