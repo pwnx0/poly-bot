@@ -8,4 +8,5 @@ venv/
 *.log
 recon/
 sessions.json
+.smart_cache.json
 .DS_Store
