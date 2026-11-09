@@ -9,4 +9,5 @@ venv/
 recon/
 sessions.json
 .smart_cache.json
+.sleep_schedule.json
 .DS_Store
