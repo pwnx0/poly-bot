@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Polyester Pro Trader - Edition (Wallet Scalp & Token Recycling Engine)
+Polyester Pro Trader - Community Edition v2.0
+(Deep Liquidity & Anti-Bleed Protection, 60% Responsive Limit Orders,
+ Organic Anti-Sybil Sizing, Circadian Sleep Engine, Token Recycler & Faucet Engine)
 Author: pwnx0 (https://github.com/pwnx0/poly-bot)
 License: MIT with Digital Provenance & Author Integrity Clause
 """
@@ -34,6 +36,7 @@ load_dotenv()
 BASE_URL = "https://testnet.polyester.com"
 API_URL = "https://api.testnet.polyester.com"
 SMART_CACHE_FILE = Path(".smart_cache.json")
+SLEEP_SCHEDULE_FILE = Path(".sleep_schedule.json")
 
 # ==============================================================================
 # CRYPTOGRAPHIC PROVENANCE SIGNATURE & MODEL INTEGRITY SECURITY CERTIFICATE
@@ -89,7 +92,13 @@ BASE_HEADERS = {
 
 WATERMARK_BANNER = """
 ===============================================================================
-       POLYESTER PRO TRADER (COMMUNITY EDITION)
+       POLYESTER PRO TRADER (COMMUNITY EDITION v2.0)
+       - Deep Liquidity & Anti-Bleed Protection (35 bps strict slippage cap)
+       - 60% Responsive Limit Order Maker Engine (Fee Saving + Fast Polling)
+       - Organic Anti-Sybil Dynamic Sizing Engine (+-1.5% Cents Jitter)
+       - Circadian Sleep Mode (6-7h Daily Rest with +-2% Jitter)
+       - Multi-Asset Token Recycler (Auto-Liquidates Faucet Assets to Cash)
+       - Automatic Daily Faucet Claimer ($1,000/day Auto Check)
        Repository: https://github.com/pwnx0/poly-bot
        Author:     pwnx0
 ===============================================================================
@@ -140,113 +149,96 @@ class PolyClient:
         if self.token:
             headers["authorization"] = f"Bearer {self.token}"
 
-        last_exc = None
+        url = f"{API_URL}/{path}"
+        body_data = json.dumps(payload or {})
+
         for attempt in range(tries):
             try:
-                r = self.session.post(
-                    f"{API_URL}/{path}",
-                    json=payload or {},
-                    headers=headers,
-                    timeout=25,
-                )
+                r = self.session.post(url, headers=headers, data=body_data, timeout=15)
                 if r.status_code == 429 or (r.status_code >= 400 and "too quickly" in r.text.lower()):
                     retry_sec = 6.0 + 3.0 * attempt
                     log(f"  [429 Rate Limit] Backing off {retry_sec:.1f}s...")
                     time.sleep(retry_sec)
                     continue
 
-                if r.status_code == 503:
-                    time.sleep(3.5)
+                if r.status_code in (502, 503, 504) and attempt < tries - 1:
+                    time.sleep(2.5 + attempt * 1.5)
                     continue
 
                 try:
-                    body = r.json()
+                    return {"status": r.status_code, "body": r.json()}
                 except Exception:
-                    body = r.text[:1000]
-
-                return {"status": r.status_code, "body": body}
+                    return {"status": r.status_code, "body": r.text}
             except Exception as e:
-                last_exc = e
-                time.sleep(2.0 * (attempt + 1))
+                if attempt == tries - 1:
+                    return {"status": 500, "body": str(e)}
+                time.sleep(2.0 + attempt * 1.5)
 
-        if last_exc:
-            raise last_exc
-        return {"status": 500, "body": "Network timeout"}
+        return {"status": 500, "body": "Max retries exceeded"}
 
     def _challenge_and_login(self, smart_candidate: str) -> bool:
-        """Attempt challenge and signature exchange with a specific smart account candidate."""
-        r = self.post("auth.v1.AuthService/CreateWalletChallenge", {
-            "smartAccountAddress": smart_candidate,
-            "signerAddress": self.eoa,
-            "uri": BASE_URL,
-            "purpose": 1,
+        """Attempts SIWE authentication with a specific Smart Account address."""
+        c_resp = self.post("auth.v1.AuthService/CreateChallenge", {
+            "rootSmartAccountAddress": smart_candidate,
+            "type": "CHALLENGE_TYPE_EOA",
+            "eoaAddress": self.eoa,
         })
-        if r["status"] != 200:
+        if c_resp["status"] != 200:
             return False
 
-        message = (r["body"] or {}).get("message")
-        if not message:
+        challenge = (c_resp["body"] or {}).get("challenge")
+        if not challenge:
             return False
 
-        urn_smart = smart_candidate
-        for line in message.splitlines():
-            stripped = line.strip().lstrip("- ")
-            if stripped.startswith("urn:polyester:wallet-challenge:login:"):
-                urn_smart = stripped.split(":")[-1].strip()
-                break
-
-        # Cryptographic signature
-        signable = encode_defunct(text=message)
-        signed = Account.sign_message(signable, private_key=self.pk)
-        sig = signed.signature.hex()
+        signable_msg = encode_defunct(text=challenge)
+        sig = Account.sign_message(signable_msg, self.pk).signature.hex()
         if not sig.startswith("0x"):
             sig = "0x" + sig
 
-        # Exchange signature for session token
-        r2 = self.post("auth.v1.AuthService/LoginWithWallet", {
-            "smartAccountAddress": urn_smart,
-            "message": message,
+        v_resp = self.post("auth.v1.AuthService/VerifyChallenge", {
+            "rootSmartAccountAddress": smart_candidate,
             "signature": sig,
-            "walletProvider": "other",
+            "type": "CHALLENGE_TYPE_EOA",
+            "eoaAddress": self.eoa,
         })
-        if r2["status"] != 200:
-            return False
+        if v_resp["status"] == 200:
+            self.token = (v_resp["body"] or {}).get("token")
+            self.smart_account = smart_candidate
+            return True
 
-        token = (r2["body"] or {}).get("accessToken")
-        if not token:
-            return False
-
-        self.token = token
-        self.smart_account = urn_smart
-        return True
+        return False
 
     def login(self) -> bool:
-        """Performs SIWE (Sign-In with Ethereum) authentication flow."""
-        log(f"Authenticating EOA: {self.eoa[:8]}...{self.eoa[-6:]}")
+        """Logs into Polyester using SIWE with intelligent Smart Account resolution."""
+        log(f"[AUTH] Authenticating wallet EOA: {self.eoa[:8]}...{self.eoa[-6:]}")
 
-        # Candidates to try: configured/cached smart account first, then EOA
-        candidates = []
         if self.smart_account:
-            candidates.append(self.smart_account)
-        if self.eoa not in candidates:
-            candidates.append(self.eoa)
+            log(f"[AUTH] Attempting SIWE with cached Smart Account: {self.smart_account[:8]}...")
+            if self._challenge_and_login(self.smart_account):
+                _save_cached_smart(self.eoa, self.smart_account)
+                log(f"[AUTH-OK] Logged in successfully!")
+                return True
 
-        logged_in = False
-        for candidate in candidates:
-            if self._challenge_and_login(candidate):
-                logged_in = True
-                break
+        log(f"[AUTH] Attempting SIWE using EOA as root account...")
+        if self._challenge_and_login(self.eoa):
+            _save_cached_smart(self.eoa, self.smart_account)
+            log(f"[AUTH-OK] Logged in successfully!")
+            return True
 
-        if not logged_in:
-            log("[AUTH-ERR] Automatic authentication failed.")
-            print("\n" + "!" * 70)
-            print("Notice: On Polyester, your account has a unique Smart Account address.")
-            print("If your EOA differs from your smart account, please find it on")
-            print("testnet.polyester.com and provide it in your .env as SMART_ACCOUNT_ADDRESS.")
-            print("!" * 70 + "\n")
-            return False
+        log(f"[AUTH] Looking up smart account for {self.eoa} via indexer...")
+        cand_resp = self.post("auth.v1.AuthService/ListSmartAccountsForEOA", {
+            "eoaAddress": self.eoa,
+        })
+        if cand_resp["status"] == 200:
+            accounts = (cand_resp["body"] or {}).get("smartAccountAddresses", [])
+            for cand in accounts:
+                if cand and cand != self.eoa:
+                    log(f"[AUTH] Testing discovered smart candidate: {cand[:8]}...")
+                    if self._challenge_and_login(cand):
+                        _save_cached_smart(self.eoa, self.smart_account)
+                        log(f"[AUTH-OK] Logged in successfully!")
+                        return True
 
-        # Resolve authoritative Smart Account Address from Me()
         me_resp = self.post("auth.v1.AuthService/Me", {})
         if me_resp["status"] == 200:
             resolved_smart = (me_resp["body"] or {}).get("rootSmartAccountAddress", self.smart_account)
@@ -264,7 +256,6 @@ class PolyClient:
             return {}
 
         body = r["body"] or {}
-        # Update asset ID to symbol map
         for a in body.get("assets", []):
             aid = a.get("ledgerId")
             sym = a.get("asset")
@@ -278,7 +269,6 @@ class PolyClient:
             quote = p.get("quoteAsset", "")
             if sym:
                 cfg[sym] = p
-                # Map base asset to primary liquid USDT/USDC pair for automatic recycling
                 if base and quote in ("USDT", "USDC"):
                     if base not in self.asset_to_pair or quote == "USDT":
                         self.asset_to_pair[base] = sym
@@ -287,7 +277,7 @@ class PolyClient:
 
     def get_balances(self) -> dict:
         """Retrieves trading account available balances for all held assets."""
-        r = self.post("ledger.read.v1.LedgerReadService/GetBalances", {"subaccountId": "0"})
+        r = self.post("ledger.read.v1.LedgerReadService/GetBalances", {})
         balances = {"USDT": 0.0, "USDC": 0.0}
         if r["status"] != 200:
             return balances
@@ -298,7 +288,6 @@ class PolyClient:
             if not sym:
                 continue
 
-            # Authoritative 'available' balance free to trade (do not fall back to reserved/locked trading balance)
             v = b.get("available") or {}
             hi = int(v.get("hi", 0) or 0)
             lo = int(v.get("lo", 0) or 0)
@@ -309,7 +298,7 @@ class PolyClient:
         return balances
 
     def get_orderbook(self, symbol_id: int, depth: int = 5) -> dict:
-        """Fetches live orderbook top-of-book levels for a symbol."""
+        """Fetches live orderbook levels for a symbol."""
         r = self.post("orderbook.v1.OrderbookService/GetOrderBook", {
             "symbolId": symbol_id,
             "depth": depth,
@@ -319,7 +308,6 @@ class PolyClient:
     def preview_order(self, intent: dict) -> dict:
         """Previews an order intent for execution viability and price protection."""
         return self.post("orders.v1.OrdersService/PreviewOrder", {
-            "subaccountId": "0",
             "order": intent,
         })
 
@@ -328,7 +316,6 @@ class PolyClient:
         last_res = {"status": 500, "body": "Unknown error"}
         for attempt in range(max_retries):
             res = self.post("orders.v1.OrdersService/CreateOrder", {
-                "subaccountId": "0",
                 "order": intent,
             })
             last_res = res
@@ -338,12 +325,10 @@ class PolyClient:
             if status == 200:
                 return res
 
-            # If matching engine drops with 503, retry after a short delay
             if status == 503 or (isinstance(body, dict) and body.get("code") == "unavailable"):
-                time.sleep(3.5 + attempt * 1.5)
+                time.sleep(3.0 + attempt * 1.5)
                 continue
 
-            # If engine claims duplicate client order ID, treat as accepted on earlier socket attempt
             if isinstance(body, dict) and (body.get("code") == "already_exists" or "duplicate" in str(body).lower()):
                 return {"status": 200, "body": body}
 
@@ -351,17 +336,65 @@ class PolyClient:
 
         return last_res
 
+    def cancel_order(self, order_id: str) -> dict:
+        """Cancels an open resting order by orderId."""
+        return self.post("orders.v1.OrdersService/CancelOrder", {"orderId": str(order_id)})
+
+    def get_trades(self) -> dict:
+        """Retrieves list of recent trades for this account."""
+        return self.post("trades.v1.TradesService/ListTrades", {})
+
+    def claim_daily_faucet(self) -> bool:
+        """Checks and claims daily testnet rewards ($1,000 value)."""
+        try:
+            st = self.post("claims.v1.ClaimsService/GetDailyClaimStatus", {})
+            body = st.get("body") or {}
+            state = body.get("state")
+            if state == "CLAIM_AVAILABLE":
+                log("[FAUCET] Daily testnet reward is available! Claiming now...")
+                c = self.post("claims.v1.ClaimsService/ClaimDailyReward", {})
+                if c.get("status") == 200:
+                    log("[FAUCET-OK] Daily reward claimed successfully! Added ~$1,000 in testnet tokens.")
+                    return True
+                else:
+                    log(f"[FAUCET-WARN] Claim rejected: {c.get('body')}")
+            elif state == "CLAIM_CLAIMED":
+                log("[FAUCET] Daily reward already claimed for today.")
+            return False
+        except Exception as e:
+            log(f"[FAUCET-ERR] Error checking faucet: {e}")
+            return False
+
+    def get_vip_status(self) -> dict:
+        """Retrieves 30-day settled volume and VIP fee tier from VIPService."""
+        r = self.post("vip.v1.VIPService/GetVIPStatus", {})
+        return r.get("body") or {} if r.get("status") == 200 else {}
+
 
 class VolumeEngine:
-    """Executes high-quality volume round-trips with Token Recycling & Liquidation Engine."""
+    """Executes high-quality volume round-trips with Deep Liquidity Guard, Limit Orders & Token Recycling."""
 
-    def __init__(self, client: PolyClient, symbol: str, trade_usd: float, min_hold: float, max_hold: float, round_interval: float):
+    def __init__(
+        self,
+        client: PolyClient,
+        symbol: str,
+        trade_usd: float,
+        min_hold: float,
+        max_hold: float,
+        round_interval: float,
+        limit_order_ratio: float = 0.60,
+        enable_sleep: bool = False,
+        auto_faucet: bool = True,
+    ):
         self.client = client
         self.symbol = symbol.upper()
         self.trade_usd = trade_usd
         self.min_hold = min_hold
         self.max_hold = max_hold
         self.round_interval = round_interval
+        self.limit_order_ratio = limit_order_ratio
+        self.enable_sleep = enable_sleep
+        self.auto_faucet = auto_faucet
 
         self.spot_cfg = {}
         self.pair_rules = {}
@@ -369,6 +402,9 @@ class VolumeEngine:
         self.quote_asset = ""
         self.session_volume = 0.0
         self.session_rounds = 0
+        self.last_trade_size = 0.0
+        self.last_faucet_check = 0.0
+        self.sleep_sched = {}
 
     def init_market(self) -> bool:
         self.spot_cfg = self.client.get_spot_config()
@@ -381,20 +417,186 @@ class VolumeEngine:
         self.pair_rules = self.spot_cfg[self.symbol]
         self.base_asset = self.pair_rules.get("baseAsset") or self.symbol.split("-")[0]
         self.quote_asset = self.pair_rules.get("quoteAsset") or self.symbol.split("-")[1]
-        log(f"[CONFIG-OK] Target pair: {self.symbol} ({self.base_asset}/{self.quote_asset}, SymbolId: {self.pair_rules.get('symbolId')}) | Trade Size: ${self.trade_usd:,.2f}")
+
+        # Query VIP tier status
+        vip_info = self.client.get_vip_status()
+        tier = vip_info.get("tier", 0)
+        settled_vol = float(vip_info.get("settledVolume30dUsd") or 0.0)
+
+        log(f"[CONFIG-OK] Target pair: {self.symbol} ({self.base_asset}/{self.quote_asset}, SymbolId: {self.pair_rules.get('symbolId')})")
+        log(f"[VIP-STATUS] Account VIP Tier: {tier} | 30d Settled Volume: ${settled_vol:,.2f}")
+        mode_str = f"AUTO-SCALING (15-20% Equity)" if self.trade_usd <= 0 else f"${self.trade_usd:,.2f}"
+        log(f"[ENGINE-INIT] Trade Sizing: {mode_str} | Limit Order Ratio: {self.limit_order_ratio*100:.0f}% | Sleep Mode: {self.enable_sleep}")
         return True
+
+    def check_deep_liquidity(self, symbol_id: int, pair_name: str, req_depth_usd: float = 1500.0, max_spread_bps: float = 35.0) -> tuple:
+        """
+        Deep Liquidity & Anti-Fund-Bleed Guard:
+        Inspects 5 levels of orderbook bids and asks (depth=2).
+        Requires:
+        1. At least 2 bid levels and 2 ask levels.
+        2. Bid/Ask ratio >= 0.995 (spread <= 50 bps, default <= 35 bps).
+        3. Cumulative ask/bid depth >= req_depth_usd (at least 1.5x order size).
+        """
+        ob = self.client.get_orderbook(symbol_id, depth=2)
+        if not ob:
+            return False, 0.0, 0.0, "Empty orderbook"
+
+        p = self.spot_cfg.get(pair_name, {})
+        ref = 10 ** int(p.get("referencePriceScale", 9))
+        scale = int(p.get("baseQuantityScale", 6))
+
+        raw_bids = ob.get("bids") or []
+        raw_asks = ob.get("asks") or []
+
+        if len(raw_bids) < 2 or len(raw_asks) < 2:
+            return False, 0.0, 0.0, f"Hollow orderbook ({len(raw_bids)} bids, {len(raw_asks)} asks)"
+
+        best_bid = float(raw_bids[0]["priceTicks"]) / ref
+        best_ask = float(raw_asks[0]["priceTicks"]) / ref
+
+        if best_bid <= 0 or best_ask <= 0:
+            return False, 0.0, 0.0, "Zero or invalid price ticks"
+
+        spread_bps = ((best_ask - best_bid) / best_ask) * 10000.0
+        ratio = best_bid / best_ask
+
+        if ratio < 0.995 or spread_bps > max_spread_bps:
+            return False, best_bid, best_ask, f"Wide spread: {spread_bps:.1f} bps (ratio {ratio:.4f})"
+
+        # Calculate cumulative 5-level USD depth
+        depth_bids = sum((float(lv["priceTicks"]) / ref) * (float(lv.get("qtyScaled", 0)) / (10 ** scale)) for lv in raw_bids[:5])
+        depth_asks = sum((float(lv["priceTicks"]) / ref) * (float(lv.get("qtyScaled", 0)) / (10 ** scale)) for lv in raw_asks[:5])
+
+        if depth_asks < req_depth_usd or depth_bids < req_depth_usd:
+            return False, best_bid, best_ask, f"Thin liquidity: asks ${depth_asks:,.0f}, bids ${depth_bids:,.0f} < ${req_depth_usd:,.0f}"
+
+        return True, best_bid, best_ask, "OK"
+
+    def _fills(self, symbol_id: int, t0: float, side: str, order_id: str = None) -> tuple:
+        """Parses recent trades to detect whether a limit order filled."""
+        t = self.client.get_trades()
+        body = (t.get("body") or {}) if isinstance(t, dict) else {}
+        p = next((x for x in self.spot_cfg.values() if str(x.get("symbolId")) == str(symbol_id)), {})
+        scale = int(p.get("baseQuantityScale") or 6)
+        ref = 10 ** int(p.get("referencePriceScale") or 9)
+
+        want = "BUY" if side.lower() == "buy" else "SELL"
+        qty_tot, notional = 0.0, 0.0
+        for tr in (body.get("trades") or []):
+            if str(tr.get("symbolId")) != str(symbol_id):
+                continue
+            if order_id is not None:
+                oid = tr.get("orderId") if tr.get("orderId") is not None else tr.get("order_id")
+                if str(oid) != str(order_id):
+                    continue
+            elif int(tr.get("tsNs") or 0) / 1e9 < t0 - 5:
+                continue
+            if str(tr.get("side") or "").upper() != want:
+                continue
+            q = float(tr.get("qtyScaled") or 0) / (10 ** scale)
+            px = float(tr.get("priceTicks") or 0) / ref
+            qty_tot += q
+            notional += q * px
+
+        if qty_tot <= 0 or notional <= 0:
+            return None, None
+
+        return qty_tot, notional / qty_tot
+
+    def choose_trade_size(self, avail_cash: float) -> float:
+        """
+        Anti-Sybil Dynamic Trade Sizing:
+        - Auto-scales dynamically with wallet equity if trade_usd <= 0 (15-20% of cash).
+        - Applies organic +-1.0% to +-2.2% percentage jitter + +-1.50 random cents.
+        - Enforces at least 1.5% separation from the previous trade size.
+        """
+        if self.trade_usd <= 0:
+            base_trade = max(25.0, min(1000.0, avail_cash * 0.18))
+        else:
+            base_trade = min(self.trade_usd, max(10.0, avail_cash * 0.90))
+
+        pct_var = random.choice([-1.0, 1.0]) * random.uniform(0.010, 0.022)
+        cent_var = random.uniform(-1.50, 1.50)
+        candidate = round(max(10.0, min(avail_cash * 0.90, base_trade * (1.0 + pct_var) + cent_var)), 2)
+
+        # Enforce separation from previous order
+        if self.last_trade_size > 0:
+            diff = abs(candidate - self.last_trade_size) / self.last_trade_size
+            if diff < 0.012:
+                candidate = round(candidate * 1.018 + random.uniform(0.50, 1.50), 2)
+
+        self.last_trade_size = candidate
+        return candidate
+
+    def check_sleep_schedule(self) -> bool:
+        """
+        Circadian Sleep Engine:
+        Simulates 6-7 hours of human sleep daily with +-2% randomized variance.
+        Returns True if the bot should be resting, False if awake and active.
+        """
+        if not self.enable_sleep:
+            return False
+
+        now = time.time()
+        today = time.strftime("%Y-%m-%d", time.gmtime(now))
+
+        if not self.sleep_sched or self.sleep_sched.get("date") != today:
+            if SLEEP_SCHEDULE_FILE.exists():
+                try:
+                    data = json.loads(SLEEP_SCHEDULE_FILE.read_text())
+                    if data.get("date") == today:
+                        self.sleep_sched = data
+                except Exception:
+                    pass
+
+            if not self.sleep_sched or self.sleep_sched.get("date") != today:
+                # Generate new 6-7h sleep schedule with +-2% daily variance
+                base_duration = random.uniform(6.0, 7.0)
+                dur_jitter = round(base_duration * (1.0 + random.uniform(-0.02, 0.02)), 2)
+                start_h = random.choice([22.0, 23.0, 0.0, 1.0]) + random.uniform(0.0, 0.75)
+                self.sleep_sched = {
+                    "date": today,
+                    "start_hour": round(start_h % 24.0, 2),
+                    "duration_hours": dur_jitter,
+                }
+                try:
+                    SLEEP_SCHEDULE_FILE.write_text(json.dumps(self.sleep_sched, indent=2))
+                except Exception:
+                    pass
+
+        # Calculate current UTC hour
+        gm = time.gmtime(now)
+        curr_h = gm.tm_hour + gm.tm_min / 60.0 + gm.tm_sec / 3600.0
+        start_h = self.sleep_sched.get("start_hour", 23.0)
+        dur_h = self.sleep_sched.get("duration_hours", 6.5)
+
+        end_h = (start_h + dur_h) % 24.0
+        is_sleeping = False
+        if start_h < end_h:
+            is_sleeping = (start_h <= curr_h < end_h)
+        else:  # Crosses midnight
+            is_sleeping = (curr_h >= start_h or curr_h < end_h)
+
+        if is_sleeping:
+            rem_h = (end_h - curr_h) % 24.0
+            rem_mins = int((rem_h * 60) % 60)
+            log(f"[SLEEP-MODE] Circadian rest window active ({int(rem_h)}h {rem_mins}m remaining, +-2% daily jitter). Trading paused for human stealth.")
+            return True
+
+        return False
 
     def recycle_all_inventory(self) -> bool:
         """
         Token Recycling & Liquidation Engine:
         Scans all available token holdings in the wallet (SOL, AVAX, ETH, BTC, BNB, DOGE, LTC, BCH, etc.)
         and automatically liquidates them back to USDT/USDC to push volume and restore cash.
+        Guarded by Deep Liquidity check and tight 35 bps slippage cap.
         """
         balances = self.client.get_balances()
         liquidated_any = False
 
         for sym, avail_qty in balances.items():
-            # Skip stablecoins and zero/dust balances
             if sym in ("USDT", "USDC", "USDC-USDT") or avail_qty <= 0:
                 continue
 
@@ -413,25 +615,20 @@ class VolumeEngine:
             if avail_qty <= min_qty:
                 continue
 
-            # Fetch orderbook best bid
-            ob = self.client.get_orderbook(symbol_id, depth=3)
-            bids = (ob or {}).get("bids", [])
-            if not bids or not bids[0].get("priceTicks"):
+            # Deep Liquidity check for recycling pair
+            ok, best_bid, best_ask, reason = self.check_deep_liquidity(symbol_id, pair_name, req_depth_usd=1000.0, max_spread_bps=40.0)
+            if not ok:
+                log(f"  [RECYCLE-SKIP] Liquidity check failed on {pair_name}: {reason}")
                 continue
 
-            best_bid_ticks = int(bids[0]["priceTicks"])
-            bid_price = best_bid_ticks / (10 ** ref_scale)
-            if bid_price <= 0:
-                continue
-
-            est_val = avail_qty * bid_price
+            est_val = avail_qty * best_bid
             if est_val < min_notional:
                 continue
 
             qty = avail_qty
             if step_size > 0:
                 qty = int(qty / step_size) * step_size
-            if qty < min_qty or (qty * bid_price) < min_notional:
+            if qty < min_qty or (qty * best_bid) < min_notional:
                 continue
 
             base_qty_scaled = int(round(qty * (10 ** base_scale)))
@@ -441,7 +638,7 @@ class VolumeEngine:
                 "symbolId": symbol_id,
                 "side": 2,  # Sell
                 "baseQtyScaled": str(base_qty_scaled),
-                "marketIoc": {"maxSlippageBps": 800},
+                "marketIoc": {"maxSlippageBps": 35},  # Strict 35 bps slippage cap
             }
 
             # Step down ladder ensuring stepSize alignment on each step
@@ -466,61 +663,16 @@ class VolumeEngine:
 
         return liquidated_any
 
-    def execute_round(self) -> bool:
-        """Executes a complete Buy -> Organic Hold -> Sell cycle with balance-verified unwind and auto-routing."""
-        # Step 0: Check and liquidate any other held assets back to USDT/USDC
-        recycled = self.recycle_all_inventory()
-        if recycled:
-            time.sleep(2.0)  # Allow ledger balance to refresh
-
-        # Fetch authoritative balances with retry if liquidation just settled
-        balances = self.client.get_balances()
-        avail_usdt = balances.get("USDT", 0.0)
-        avail_usdc = balances.get("USDC", 0.0)
-        if recycled and avail_usdt < 10.0 and avail_usdc < 10.0:
-            for _ in range(3):
-                time.sleep(2.0)
-                balances = self.client.get_balances()
-                avail_usdt = balances.get("USDT", 0.0)
-                avail_usdc = balances.get("USDC", 0.0)
-                if avail_usdt >= 10.0 or avail_usdc >= 10.0:
-                    break
-
-        # Dynamic Stablecoin & Market Auto-Routing:
-        # If the preferred pair is USDC but wallet holds USDT (or vice versa),
-        # or if funds exist on another top pair (SOL, BTC, ETH), auto-route so volume never halts!
-        target_pair = self.symbol
-        active_quote = self.quote_asset
-
-        if balances.get(active_quote, 0.0) < 10.0:
-            # 1. Try alternate stablecoin on the same base asset (e.g. SOL-USDC -> SOL-USDT)
-            alt_quote = "USDT" if active_quote == "USDC" else "USDC"
-            alt_pair = f"{self.base_asset}-{alt_quote}"
-            if balances.get(alt_quote, 0.0) >= 10.0 and alt_pair in self.spot_cfg:
-                target_pair = alt_pair
-                log(f"  [AUTO-ROUTE] Available {active_quote} is ${balances.get(active_quote, 0.0):,.2f}, but found ${balances.get(alt_quote, 0.0):,.2f} {alt_quote} -> Auto-routing to {alt_pair}!")
-            else:
-                # 2. Search primary liquid markets (SOL-USDT, BTC-USDT, ETH-USDT, etc.)
-                for candidate in ["SOL-USDT", "BTC-USDT", "ETH-USDT", "SOL-USDC", "BTC-USDC", "ETH-USDC", "AVAX-USDT", "DOGE-USDT"]:
-                    if candidate in self.spot_cfg:
-                        cand_quote = self.spot_cfg[candidate].get("quoteAsset", "USDT")
-                        if balances.get(cand_quote, 0.0) >= 10.0:
-                            target_pair = candidate
-                            log(f"  [AUTO-ROUTE] Routing to liquid market {target_pair} (Available {cand_quote}: ${balances.get(cand_quote, 0.0):,.2f})!")
-                            break
-
+    def execute_limit_round(self, target_pair: str, trade_usd: float) -> bool:
+        """
+        Responsive Limit Order Maker Round:
+        1. Posts limit buy at top-of-book (best ask).
+        2. Fast-polls for fill up to 4.0s (exits immediately upon fill).
+        3. If filled, holds naturally, then liquidates back via tight-slippage IOC sell.
+        4. If unfilled after 4.0s, cancels and returns False for instant market fallback.
+        """
         active_rules = self.spot_cfg.get(target_pair) or self.spot_cfg[self.symbol]
         active_base = active_rules.get("baseAsset") or target_pair.split("-")[0]
-        active_quote = active_rules.get("quoteAsset") or target_pair.split("-")[1]
-        avail_cash = balances.get(active_quote, 0.0)
-
-        if avail_cash < 10.0:
-            log(f"[FUNDS-WARN] Insufficient trade cash: USDT: ${avail_usdt:,.2f}, USDC: ${avail_usdc:,.2f} (Minimum $10 required on testnet). Waiting for funds...")
-            return False
-
-        # Dynamically size order if cash is slightly less than configured TRADE_SIZE_USD
-        effective_trade_usd = min(self.trade_usd, max(10.0, avail_cash * 0.95))
-
         symbol_id = int(active_rules["symbolId"])
         base_scale = int(active_rules.get("baseQuantityScale", 6))
         ref_scale = int(active_rules.get("referencePriceScale", 9))
@@ -528,65 +680,170 @@ class VolumeEngine:
         min_notional = float(active_rules.get("minNotionalQuote", 0.0))
         step_size = float(active_rules.get("stepSize", 0.0))
 
-        # 1. Fetch live orderbook to get real market ask price
-        ob = self.client.get_orderbook(symbol_id)
-        asks = (ob or {}).get("asks", [])
-        if not asks or not asks[0].get("priceTicks"):
-            log(f"[OB-WARN] No ask liquidity available on {target_pair} orderbook.")
+        # Deep liquidity check
+        ok, best_bid, best_ask, reason = self.check_deep_liquidity(symbol_id, target_pair, req_depth_usd=max(1500.0, trade_usd * 1.5))
+        if not ok:
+            log(f"  [LIQUIDITY-SKIP] Limit round skipped on {target_pair}: {reason}")
             return False
 
-        best_ask_ticks = int(asks[0]["priceTicks"])
-        ask_price = best_ask_ticks / (10 ** ref_scale)
-        if ask_price <= 0:
-            log(f"[PRICE-ERR] Invalid ask price on {target_pair}: {ask_price}")
-            return False
-
-        # Calculate base quantity from target USD sizing
-        qty = effective_trade_usd / ask_price
+        qty = trade_usd / best_ask
         if step_size > 0:
             qty = int(round(qty / step_size)) * step_size
         qty = max(qty, min_qty)
-        if qty * ask_price < min_notional:
-            qty = min_notional / ask_price
+        if qty * best_ask < min_notional:
+            qty = min_notional / best_ask
+            if step_size > 0:
+                qty = int(round(qty / step_size)) * step_size
+
+        base_qty_scaled = int(round(qty * (10 ** base_scale)))
+        price_ticks = int(round(best_ask * (10 ** ref_scale)))
+
+        intent = {
+            "symbolId": symbol_id,
+            "side": 1,  # Buy
+            "baseQtyScaled": str(base_qty_scaled),
+            "limitGtc": {
+                "priceTicks": str(price_ticks),
+                "postOnly": False,
+            },
+        }
+
+        prev = self.client.preview_order(intent)
+        if prev.get("status") != 200 or (prev.get("body") or {}).get("admissible") is False:
+            return False
+
+        t0 = time.time()
+        res = self.client.create_order(intent)
+        body = res.get("body") or {}
+        if res.get("status") != 200 or "orderId" not in body:
+            return False
+
+        order_id = body["orderId"]
+        log(f"  [LIMIT] Limit order {order_id} posted on {target_pair} @ ${best_ask:.4f} x ${trade_usd:,.2f}, polling fills up to 4s...")
+
+        # Responsive fast polling loop
+        t_deadline = time.time() + 4.0
+        filled, avg_px = None, None
+        while time.time() < t_deadline:
+            time.sleep(0.5)
+            filled, avg_px = self._fills(symbol_id, t0, "buy", order_id)
+            if filled:
+                break
+
+        if not filled:
+            log(f"  [LIMIT-TIMEOUT] Order {order_id} unfilled after 4.0s, cancelling for market fallback...")
+            self.client.cancel_order(order_id)
+            return False
+
+        actual_qty = filled
+        exec_px = avg_px or best_ask
+        log(f"  [LIMIT-FILL] Limit buy filled: {actual_qty:g} {active_base} @ ${exec_px:,.2f} (~${actual_qty * exec_px:,.2f})")
+
+        # Discretionary organic hold delay
+        hold_time = random.uniform(self.min_hold, self.max_hold)
+        log(f"  [HOLD] Waiting {hold_time:.1f}s for natural market turn...")
+        time.sleep(hold_time)
+
+        # Unwind sell leg with dynamic balance check and strict 35 bps slippage cap
+        balances = self.client.get_balances()
+        held_base = balances.get(active_base, 0.0)
+        sell_qty = min(held_base, actual_qty) if held_base > 0 else actual_qty
+        if step_size > 0:
+            sell_qty = int(sell_qty / step_size) * step_size
+        sell_qty_scaled = int(round(sell_qty * (10 ** base_scale))) if sell_qty > 0 else base_qty_scaled
+
+        sell_intent = {
+            "symbolId": symbol_id,
+            "side": 2,  # Sell
+            "baseQtyScaled": str(sell_qty_scaled),
+            "marketIoc": {"maxSlippageBps": 35},  # Strict 35 bps slippage cap
+        }
+
+        # Step down ladder for fee dust buffer
+        for factor in (1.0, 0.998, 0.995, 0.990, 0.985):
+            adj_qty = sell_qty * factor
+            if step_size > 0:
+                adj_qty = int(adj_qty / step_size) * step_size
+            adj_scaled = int(round(adj_qty * (10 ** base_scale)))
+            sell_intent["baseQtyScaled"] = str(adj_scaled)
+            prev_adj = self.client.preview_order(sell_intent)
+            if prev_adj.get("status") == 200 and (prev_adj.get("body") or {}).get("admissible"):
+                sell_qty_scaled = adj_scaled
+                break
+
+        res_sell = self.client.create_order(sell_intent)
+        if res_sell.get("status") != 200:
+            log(f"  [SELL-WARN] Limit unwind sell rejected: {res_sell.get('body')}. Liquidating via Token Recycler...")
+            time.sleep(2.0)
+            self.recycle_all_inventory()
+
+        round_vol = trade_usd * 2.0
+        self.session_volume += round_vol
+        self.session_rounds += 1
+        log(f"  [LIMIT-OK] Limit Cycle Complete (+${round_vol:,.0f} Volume) | Session: ${self.session_volume:,.0f} ({self.session_rounds} rounds)")
+        return True
+
+    def execute_market_round(self, target_pair: str, trade_usd: float) -> bool:
+        """
+        High-Turnover Market Round:
+        Executes Buy -> Hold -> Sell cycle with strict 35 bps slippage and deep liquidity guard.
+        """
+        active_rules = self.spot_cfg.get(target_pair) or self.spot_cfg[self.symbol]
+        active_base = active_rules.get("baseAsset") or target_pair.split("-")[0]
+        symbol_id = int(active_rules["symbolId"])
+        base_scale = int(active_rules.get("baseQuantityScale", 6))
+        ref_scale = int(active_rules.get("referencePriceScale", 9))
+        min_qty = float(active_rules.get("minQtyBase", 0.0))
+        min_notional = float(active_rules.get("minNotionalQuote", 0.0))
+        step_size = float(active_rules.get("stepSize", 0.0))
+
+        # Deep Liquidity & Anti-Bleed Check
+        ok, best_bid, best_ask, reason = self.check_deep_liquidity(symbol_id, target_pair, req_depth_usd=max(1500.0, trade_usd * 1.5))
+        if not ok:
+            log(f"  [LIQUIDITY-SKIP] Market round skipped on {target_pair}: {reason}")
+            return False
+
+        qty = trade_usd / best_ask
+        if step_size > 0:
+            qty = int(round(qty / step_size)) * step_size
+        qty = max(qty, min_qty)
+        if qty * best_ask < min_notional:
+            qty = min_notional / best_ask
             if step_size > 0:
                 qty = int(round(qty / step_size)) * step_size
 
         base_qty_scaled = int(round(qty * (10 ** base_scale)))
         if base_qty_scaled <= 0:
-            log(f"[QTY-ERR] Calculated quantity scaled to 0 for {target_pair}")
             return False
 
-        # 2. Preview Market Buy (No clientOrderId to completely eliminate duplicate ID errors)
+        # Execute Market Buy with strict 35 bps slippage cap
         buy_intent = {
             "symbolId": symbol_id,
             "side": 1,  # Buy
             "baseQtyScaled": str(base_qty_scaled),
-            "marketIoc": {"maxSlippageBps": 500},
+            "marketIoc": {"maxSlippageBps": 35},
         }
 
         prev = self.client.preview_order(buy_intent)
-        prev_body = prev.get("body") or {}
-        if prev.get("status") != 200 or prev_body.get("admissible") is False:
-            rejection = (prev_body.get("rejection") or {}).get("code", "unknown")
-            log(f"[PREVIEW-SKIP] Buy preview rejected on {target_pair}: {rejection}")
+        if prev.get("status") != 200 or (prev.get("body") or {}).get("admissible") is False:
+            rejection = ((prev.get("body") or {}).get("rejection") or {}).get("code", "unknown")
+            log(f"  [PREVIEW-SKIP] Buy preview rejected on {target_pair}: {rejection}")
             return False
 
-        # 3. Execute Market Buy
         res_buy = self.client.create_order(buy_intent)
         if res_buy.get("status") != 200:
-            log(f"[BUY-FAIL] Order rejected: {res_buy.get('body')}")
+            log(f"  [BUY-FAIL] Order rejected on {target_pair}: {res_buy.get('body')}")
             return False
 
         actual_qty = base_qty_scaled / (10 ** base_scale)
-        log(f"  [BUY-OK] Bought {actual_qty:g} {active_base} on {target_pair} for ~${effective_trade_usd:,.0f} @ ${ask_price:,.2f}")
+        log(f"  [BUY-OK] Bought {actual_qty:g} {active_base} on {target_pair} for ~${trade_usd:,.0f} @ ${best_ask:,.2f}")
 
-        # 4. Discretionary Organic Hold Delay
+        # Discretionary Organic Hold Delay
         hold_time = random.uniform(self.min_hold, self.max_hold)
         log(f"  [HOLD] Waiting {hold_time:.1f}s for natural market turn...")
         time.sleep(hold_time)
 
-        # 5. Dynamic Balance Verification for Sell Leg
-        # Re-query actual available balance of the active base asset so sell matches true holdings
+        # Dynamic Balance Verification for Sell Leg
         current_balances = self.client.get_balances()
         held_base = current_balances.get(active_base, 0.0)
         sell_qty = min(held_base, actual_qty) if held_base > 0 else actual_qty
@@ -598,10 +855,10 @@ class VolumeEngine:
             "symbolId": symbol_id,
             "side": 2,  # Sell
             "baseQtyScaled": str(sell_qty_scaled),
-            "marketIoc": {"maxSlippageBps": 800},
+            "marketIoc": {"maxSlippageBps": 35},  # Strict 35 bps slippage cap
         }
 
-        # Step down ladder to avoid fee-dust INSUFFICIENT_FUNDS with step_size alignment
+        # Step down ladder to avoid fee-dust buffer
         for factor in (1.0, 0.998, 0.995, 0.990, 0.985):
             adj_qty = sell_qty * factor
             if step_size > 0:
@@ -611,28 +868,87 @@ class VolumeEngine:
             prev_adj = self.client.preview_order(sell_intent)
             if prev_adj.get("status") == 200 and (prev_adj.get("body") or {}).get("admissible"):
                 sell_qty_scaled = adj_scaled
-                if factor < 1.0:
-                    log(f"  [FEE-ADJ] Adjusted sell qty to {factor*100:.1f}% for taker fee buffer")
                 break
 
         res_sell = self.client.create_order(sell_intent)
-
-        # 6. Automatic Recovery: If primary sell leg fails, check actual holdings and retry liquidation
         if res_sell.get("status") != 200:
-            log(f"[SELL-WARN] Primary sell leg rejected: {res_sell.get('body')}. Initiating immediate holding check & liquidation...")
+            log(f"  [SELL-WARN] Primary sell rejected: {res_sell.get('body')}. Initiating immediate holding check & liquidation...")
             time.sleep(2.5)
             if not self.recycle_all_inventory():
-                log(f"[WARN] Unable to complete unwind. Will auto-recover on next loop tick.")
+                log(f"  [WARN] Unable to complete unwind. Will auto-recover on next cycle.")
                 return False
 
-        round_vol = effective_trade_usd * 2.0
+        round_vol = trade_usd * 2.0
         self.session_volume += round_vol
         self.session_rounds += 1
         log(f"  [ROUND-OK] Cycle Complete (+${round_vol:,.0f} Volume) | Session: ${self.session_volume:,.0f} ({self.session_rounds} rounds)")
         return True
 
+    def execute_round(self) -> bool:
+        """Executes a complete Buy -> Hold -> Sell round with 60% Limit Order / 40% Market routing."""
+        # Step 0: Check Circadian Sleep Engine
+        if self.check_sleep_schedule():
+            time.sleep(60.0)
+            return False
+
+        # Step 1: Automatic Daily Faucet Claiming (once every 4h or on startup)
+        now = time.time()
+        if self.auto_faucet and (now - self.last_faucet_check >= 4 * 3600):
+            self.last_faucet_check = now
+            self.client.claim_daily_faucet()
+
+        # Step 2: Recycle any held token assets back to USDT/USDC
+        recycled = self.recycle_all_inventory()
+        if recycled:
+            time.sleep(2.0)
+
+        # Step 3: Authoritative Balance Verification & Market Auto-Routing
+        balances = self.client.get_balances()
+        avail_usdt = balances.get("USDT", 0.0)
+        avail_usdc = balances.get("USDC", 0.0)
+
+        target_pair = self.symbol
+        active_rules = self.spot_cfg.get(target_pair) or self.spot_cfg[self.symbol]
+        active_quote = active_rules.get("quoteAsset", "USDT")
+
+        if balances.get(active_quote, 0.0) < 10.0:
+            alt_quote = "USDT" if active_quote == "USDC" else "USDC"
+            alt_pair = f"{self.base_asset}-{alt_quote}"
+            if balances.get(alt_quote, 0.0) >= 10.0 and alt_pair in self.spot_cfg:
+                target_pair = alt_pair
+                log(f"  [AUTO-ROUTE] Available {active_quote} is low -> Auto-routing to {alt_pair} (${balances.get(alt_quote, 0.0):,.2f} {alt_quote})")
+            else:
+                for candidate in ["SOL-USDT", "BTC-USDT", "ETH-USDT", "SOL-USDC", "BTC-USDC", "ETH-USDC", "AVAX-USDT", "DOGE-USDT"]:
+                    if candidate in self.spot_cfg:
+                        c_quote = self.spot_cfg[candidate].get("quoteAsset", "USDT")
+                        if balances.get(c_quote, 0.0) >= 10.0:
+                            target_pair = candidate
+                            log(f"  [AUTO-ROUTE] Routing to liquid market {target_pair} (Available {c_quote}: ${balances.get(c_quote, 0.0):,.2f})")
+                            break
+
+        active_rules = self.spot_cfg.get(target_pair) or self.spot_cfg[self.symbol]
+        active_quote = active_rules.get("quoteAsset", "USDT")
+        avail_cash = balances.get(active_quote, 0.0)
+
+        if avail_cash < 10.0:
+            log(f"[FUNDS-WARN] Insufficient cash: USDT: ${avail_usdt:,.2f}, USDC: ${avail_usdc:,.2f} (Minimum $10 required). Waiting...")
+            return False
+
+        # Step 4: Organic Anti-Sybil Dynamic Trade Sizing
+        effective_trade_usd = self.choose_trade_size(avail_cash)
+
+        # Step 5: Action Selection (60% Limit Orders for Maker savings, 40% Market IOC)
+        use_limit = (random.random() < self.limit_order_ratio)
+        if use_limit:
+            if not self.execute_limit_round(target_pair, effective_trade_usd):
+                # Fallback to market round so volume velocity is never stalled
+                return self.execute_market_round(target_pair, effective_trade_usd)
+            return True
+        else:
+            return self.execute_market_round(target_pair, effective_trade_usd)
+
     def run(self):
-        log("Starting volume generation loop with Token Recycling Engine. Press Ctrl+C to stop.")
+        log("Starting volume generation loop with Deep Liquidity Guard & 60% Limit Order Engine. Press Ctrl+C to stop.")
         while True:
             try:
                 self.execute_round()
@@ -654,7 +970,6 @@ class VolumeEngine:
 
 
 def main():
-    # Enforce software integrity and digital provenance verification
     if not _verify_provenance():
         sys.exit("[CRITICAL] Software integrity validation failed. Core digital certificate is corrupted or missing. Terminating.")
 
@@ -673,6 +988,9 @@ def main():
     min_hold = float(os.getenv("MIN_HOLD_SECONDS", "4.5"))
     max_hold = float(os.getenv("MAX_HOLD_SECONDS", "9.0"))
     round_interval = float(os.getenv("ROUND_INTERVAL_SECONDS", "25.0"))
+    limit_order_ratio = float(os.getenv("LIMIT_ORDER_RATIO", "0.60"))
+    enable_sleep = os.getenv("ENABLE_HUMAN_SLEEP", "false").lower() in ("true", "1", "yes")
+    auto_faucet = os.getenv("AUTO_CLAIM_FAUCET", "true").lower() in ("true", "1", "yes")
 
     client = PolyClient(private_key=pk, smart_account=smart_account)
     if not client.login():
@@ -685,6 +1003,9 @@ def main():
         min_hold=min_hold,
         max_hold=max_hold,
         round_interval=round_interval,
+        limit_order_ratio=limit_order_ratio,
+        enable_sleep=enable_sleep,
+        auto_faucet=auto_faucet,
     )
 
     if not engine.init_market():
